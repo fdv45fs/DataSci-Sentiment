@@ -299,6 +299,7 @@ def classify_comment(
             {"role": "user", "content": user_message},
         ],
         stream=False,
+        temperature=0.0,
         extra_body={"thinking": {"type": "disabled"}},
     )
 
