@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local secrets
+.env
+
+youtube_comments_v2/
+final_dataset.csv
+youtube_comments_v2-20260502T194236Z-3-001.zip
+label_errors
