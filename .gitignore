@@ -11,3 +11,4 @@ wheels/
 *.parquet
 SentimentAnalysisApp/
 resources/
+*.jsonl
