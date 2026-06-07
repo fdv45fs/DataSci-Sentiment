@@ -103,6 +103,18 @@ def read_labeled_records(target_group: TemperatureGroup) -> list[SampleRecord]:
     return list(records.values())
 
 
+def read_existing_sample_keys(path: Path) -> set[tuple[str, int, str]]:
+    keys: set[tuple[str, int, str]] = set()
+    if not path.exists():
+        return keys
+    with path.open("r", encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            key = (row.get("source_file", ""), int(row.get("source_row", 0)), row.get("comment_id", ""))
+            keys.add(key)
+    return keys
+
+
 def read_remaining_crawled_records(excluded_keys: set[tuple[str, int, str]]) -> list[SampleRecord]:
     records: list[SampleRecord] = []
 
@@ -199,11 +211,19 @@ def build_output_rows(records: list[SampleRecord]) -> list[dict[str, Any]]:
     return output_rows
 
 
-def write_sample(output_path: Path, rows: list[dict[str, Any]]) -> None:
+def write_sample(output_path: Path, rows: list[dict[str, Any]], append: bool = False) -> None:
+    existing_rows: list[dict[str, Any]] = []
+    if append and output_path.exists():
+        with output_path.open("r", encoding="utf-8-sig", newline="") as file:
+            reader = csv.DictReader(file)
+            existing_rows = list(reader)
+
+    all_rows = existing_rows + rows
+
     with output_path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=OUTPUT_COLUMNS)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(all_rows)
 
 
 def parse_args(default_output: Path) -> argparse.Namespace:
@@ -211,24 +231,37 @@ def parse_args(default_output: Path) -> argparse.Namespace:
     parser.add_argument("--n", type=int, default=DEFAULT_SAMPLE_SIZE, help="Number of rows to sample.")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Random seed for reproducible sampling.")
     parser.add_argument("--output", type=Path, default=default_output, help="Output CSV path.")
+    parser.add_argument("--append-to", type=Path, default=None, help="Append to existing CSV file (merges new + existing rows).")
     return parser.parse_args()
 
 
 def run_sampling(target_group: TemperatureGroup, default_output: str) -> None:
     args = parse_args(ROOT / default_output)
+
+    existing_keys: set[tuple[str, int, str]] = set()
+    for existing_file in [ROOT / "manual_samples_temperature_0.csv", ROOT / "manual_samples_temperature_1.csv"]:
+        existing_keys |= read_existing_sample_keys(existing_file)
+    if args.append_to:
+        existing_keys |= read_existing_sample_keys(args.append_to)
+
     if target_group == "1.0":
-        records = read_labeled_records("1.0")
-        pool_description = "labeled_before_cutoff"
+        labeled_keys = {record.key for record in read_labeled_records("1.0")}
+        all_excluded = existing_keys | labeled_keys
+        records = read_remaining_crawled_records(all_excluded)
+        pool_description = "crawled_dataset_excluding_temperature_1_and_existing_samples"
     else:
         temperature_1_keys = {record.key for record in read_labeled_records("1.0")}
-        records = read_remaining_crawled_records(temperature_1_keys)
-        pool_description = "crawled_dataset_excluding_temperature_1"
+        all_excluded = existing_keys | temperature_1_keys
+        records = read_remaining_crawled_records(all_excluded)
+        pool_description = "crawled_dataset_excluding_temperature_1_and_existing_samples"
 
     sampled = sample_records(records, args.n, args.seed)
     rows = build_output_rows(sampled)
-    write_sample(args.output, rows)
+
+    output_path = args.append_to if args.append_to else args.output
+    write_sample(output_path, rows, append=bool(args.append_to))
 
     print(
         f"temperature_group={target_group}, pool={len(records)}, pool_source={pool_description}, "
-        f"sampled={len(rows)}, output={args.output}"
+        f"sampled={len(rows)}, output={output_path}"
     )
