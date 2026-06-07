@@ -33,7 +33,7 @@ def files_to_markdown(folder_path, output_file="output.md", glob_pattern="*"):
                     md_file.write("\n\n```\n\n")
 
                 except UnicodeDecodeError:
-                    md_file.write(f"*[Binary file - could not read content]*\n\n```\n\n")
+                    md_file.write("*[Binary file - could not read content]*\n\n```\n\n")
                 except Exception as e:
                     md_file.write(f"*[Error reading file: {e}]*\n\n```\n\n")
 

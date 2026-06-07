@@ -12,3 +12,4 @@ wheels/
 SentimentAnalysisApp/
 resources/
 *.jsonl
+*.png
