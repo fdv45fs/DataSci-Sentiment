@@ -1,4 +1,5 @@
 import polars as pl
+import os  # <--- ADDED THIS LINE
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -250,8 +251,21 @@ def compute_multilingual_descriptive_stats(df):
     plt.tight_layout()
     plt.savefig("output_data/img/p0_multilingual_descriptive_stats.png", dpi=300)
     plt.close()
-    
     logger.info("  Saved visualization to output_data/img/p0_multilingual_descriptive_stats.png")
+    
+    os.makedirs("output_data/parquet", exist_ok=True)
+    
+    stats.write_parquet("output_data/parquet/p0_multilingual_descriptive_stats.parquet")
+    
+    corr_matrix_clean = corr_matrix.fillna(0)
+    corr_df = pl.DataFrame({
+        "feature_1": np.repeat(corr_matrix_clean.columns, len(corr_matrix_clean)),
+        "feature_2": np.tile(corr_matrix_clean.index, len(corr_matrix_clean)),
+        "correlation": corr_matrix_clean.values.flatten()
+    }).filter(pl.col("feature_1") != pl.col("feature_2"))
+    corr_df.write_parquet("output_data/parquet/p0_correlation_matrix.parquet")
+    
+    logger.info("  Saved descriptive stats and correlation matrix to output_data/parquet/")
     
     elapsed = time.time() - start_time
     logger.info(f"Multilingual descriptive statistics completed in {elapsed:.2f} seconds")
@@ -276,6 +290,7 @@ def perform_dimensionality_reduction(embeddings, lang_labels, sample_size=10000)
         logger.info(f"    {lang}: {count} ({count/n_samples*100:.1f}%)")
     
     results = {}
+    pca_summary = []  # <--- ADDED THIS LINE
     fig, axes = plt.subplots(2, 2, figsize=(18, 14))
     
     for i, (name, emb) in enumerate(embeddings.items()):
@@ -289,6 +304,14 @@ def perform_dimensionality_reduction(embeddings, lang_labels, sample_size=10000)
         explained_var = pca.explained_variance_ratio_.sum()
         logger.info(f"    PCA selected {n_components} components explaining {explained_var*100:.2f}% of variance")
         results[f"{name}_pca_var"] = pca.explained_variance_ratio_
+        
+        pca_summary.append({
+            "embedding_type": name,
+            "n_components_95pct": int(n_components),
+            "variance_explained_95pct": float(explained_var),
+            "variance_10_comp": float(pca.explained_variance_ratio_[:10].sum()),
+            "variance_50_comp": float(pca.explained_variance_ratio_[:50].sum())
+        })
         
         logger.info("    Applying UMAP (n_neighbors=30, min_dist=0.1, metric=cosine)")
         reducer_umap = umap.UMAP(n_neighbors=30, min_dist=0.1, metric="cosine", n_components=2, random_state=42)
@@ -308,6 +331,10 @@ def perform_dimensionality_reduction(embeddings, lang_labels, sample_size=10000)
     plt.savefig("output_data/img/p1_embedding_umap_projections.png", dpi=300)
     plt.close()
     logger.info("  Saved UMAP projections to output_data/img/p1_embedding_umap_projections.png")
+    
+    os.makedirs("output_data/parquet", exist_ok=True)
+    pl.DataFrame(pca_summary).write_parquet("output_data/parquet/p1_pca_variance_summary.parquet")
+    logger.info("  Saved PCA variance summary to output_data/parquet/")
     
     logger.info("  Computing PCA cumulative variance plot")
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -359,8 +386,10 @@ def verify_cross_lingual_alignment(embeddings, df, lang_labels):
     logger.info(f"  Procrustes rotation matrix shape: {R.shape}")
     
     logger.info("  Computing similarity metrics")
-    sim_before = np.diag(cosine_similarity(emb_base, emb_ft)).mean()
-    sim_after = np.diag(cosine_similarity(emb_base, aligned_ft)).mean()
+    sim_before_vals = np.diag(cosine_similarity(emb_base, emb_ft))
+    sim_after_vals = np.diag(cosine_similarity(emb_base, aligned_ft))
+    sim_before = sim_before_vals.mean()
+    sim_after = sim_after_vals.mean()
     
     improvement = (sim_after - sim_before) / sim_before * 100
     logger.info(f"  Similarity before alignment: {sim_before:.4f}")
@@ -370,17 +399,31 @@ def verify_cross_lingual_alignment(embeddings, df, lang_labels):
     logger.info("  Generating alignment visualization")
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     
-    sns.histplot(np.diag(cosine_similarity(emb_base, emb_ft)), bins=30, kde=True, ax=axes[0], color="skyblue")
+    sns.histplot(sim_before_vals, bins=30, kde=True, ax=axes[0], color="skyblue")
     axes[0].set_title(f"Cross-Lingual Similarity Before Alignment (Mean: {sim_before:.3f})")
     axes[0].set_xlabel("Cosine Similarity")
     
-    sns.histplot(np.diag(cosine_similarity(emb_base, aligned_ft)), bins=30, kde=True, ax=axes[1], color="salmon")
+    sns.histplot(sim_after_vals, bins=30, kde=True, ax=axes[1], color="salmon")
     axes[1].set_title(f"Cross-Lingual Similarity After Procrustes (Mean: {sim_after:.3f})")
     axes[1].set_xlabel("Cosine Similarity")
     
     plt.tight_layout()
     plt.savefig("output_data/img/p1_cross_lingual_alignment.png", dpi=300)
     plt.close()
+    
+    # --- SAVE IMPORTANT NUMBERS TO PARQUET ---
+    alignment_summary = pl.DataFrame({
+        "metric": ["sim_before_mean", "sim_before_median", "sim_before_std", 
+                   "sim_after_mean", "sim_after_median", "sim_after_std", "improvement_pct"],
+        "value": [
+            float(sim_before_vals.mean()), float(np.median(sim_before_vals)), float(sim_before_vals.std()),
+            float(sim_after_vals.mean()), float(np.median(sim_after_vals)), float(sim_after_vals.std()),
+            float(improvement)
+        ]
+    })
+    os.makedirs("output_data/parquet", exist_ok=True)
+    alignment_summary.write_parquet("output_data/parquet/p1_cross_lingual_alignment.parquet")
+    logger.info("  Saved alignment summary to output_data/parquet/")
     
     elapsed = time.time() - start_time
     logger.info(f"Cross-lingual alignment verification completed in {elapsed:.2f} seconds")
@@ -393,6 +436,7 @@ def estimate_local_intrinsic_dimensionality(embeddings, lang_labels, k=20):
     start_time = time.time()
     
     results = {}
+    lid_summary = []
     fig, ax = plt.subplots(figsize=(10, 6))
     
     for idx, (name, emb) in enumerate(embeddings.items()):
@@ -410,6 +454,17 @@ def estimate_local_intrinsic_dimensionality(embeddings, lang_labels, k=20):
         logger.info(f"    LID statistics - mean: {lid_scores.mean():.2f}, std: {lid_scores.std():.2f}, median: {np.median(lid_scores):.2f}")
         logger.info(f"    LID range: [{lid_scores.min():.2f}, {lid_scores.max():.2f}]")
         
+        lid_summary.append({
+            "embedding_type": name,
+            "lid_mean": float(lid_scores.mean()),
+            "lid_std": float(lid_scores.std()),
+            "lid_median": float(np.median(lid_scores)),
+            "lid_min": float(lid_scores.min()),
+            "lid_max": float(lid_scores.max()),
+            "lid_25pct": float(np.percentile(lid_scores, 25)),
+            "lid_75pct": float(np.percentile(lid_scores, 75))
+        })
+        
         sns.kdeplot(lid_scores, label=name, ax=ax, fill=True, alpha=0.3)
         
         emb_elapsed = time.time() - start_emb
@@ -424,6 +479,10 @@ def estimate_local_intrinsic_dimensionality(embeddings, lang_labels, k=20):
     plt.savefig("output_data/img/p1_lid_distributions.png", dpi=300)
     plt.close()
     
+    os.makedirs("output_data/parquet", exist_ok=True)
+    pl.DataFrame(lid_summary).write_parquet("output_data/parquet/p1_lid_summary.parquet")
+    logger.info("  Saved LID summary to output_data/parquet/")
+    
     elapsed = time.time() - start_time
     logger.info(f"LID estimation completed in {elapsed:.2f} seconds")
     
@@ -434,6 +493,7 @@ def compute_persistent_homology(embeddings, sample_size=2000):
     
     start_time = time.time()
     
+    ph_summary = []
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     axes = axes.flatten()
     
@@ -459,6 +519,24 @@ def compute_persistent_homology(embeddings, sample_size=2000):
         persim.plot_diagrams(diagrams, show=False, ax=axes[i])
         axes[i].set_title(f"Persistent Homology: {name}")
         
+        h0_dgm = diagrams[0]
+        h1_dgm = diagrams[1]
+        h0_finite = h0_dgm[np.isfinite(h0_dgm[:, 1])]
+        h1_finite = h1_dgm[np.isfinite(h1_dgm[:, 1])]
+        
+        h0_persistence = h0_finite[:, 1] - h0_finite[:, 0] if len(h0_finite) > 0 else np.array([])
+        h1_persistence = h1_finite[:, 1] - h1_finite[:, 0] if len(h1_finite) > 0 else np.array([])
+        
+        ph_summary.append({
+            "embedding_type": name,
+            "h0_features": len(h0_dgm),
+            "h1_features": len(h1_dgm),
+            "h0_max_persistence": float(h0_persistence.max()) if len(h0_persistence) > 0 else 0.0,
+            "h1_max_persistence": float(h1_persistence.max()) if len(h1_persistence) > 0 else 0.0,
+            "h0_mean_persistence": float(h0_persistence.mean()) if len(h0_persistence) > 0 else 0.0,
+            "h1_mean_persistence": float(h1_persistence.mean()) if len(h1_persistence) > 0 else 0.0
+        })
+        
         progress_pct = (i + 1) / len(embeddings) * 100
         logger.info(f"    Progress: {progress_pct:.1f}% complete")
     
@@ -466,6 +544,10 @@ def compute_persistent_homology(embeddings, sample_size=2000):
     plt.savefig("output_data/img/p1_persistent_homology.png", dpi=300)
     plt.close()
     logger.info("  Saved persistent homology diagrams to output_data/img/p1_persistent_homology.png")
+    
+    os.makedirs("output_data/parquet", exist_ok=True)
+    pl.DataFrame(ph_summary).write_parquet("output_data/parquet/p1_persistent_homology_summary.parquet")
+    logger.info("  Saved persistent homology summary to output_data/parquet/")
     
     elapsed = time.time() - start_time
     logger.info(f"Persistent homology computation completed in {elapsed:.2f} seconds")
@@ -545,6 +627,17 @@ def perform_semantic_clustering(embeddings, df, lang_labels):
     plt.tight_layout()
     plt.savefig("output_data/img/p1_semantic_clustering.png", dpi=300)
     plt.close()
+    
+    os.makedirs("output_data/parquet", exist_ok=True)
+    
+    cluster_stats.write_parquet("output_data/parquet/p1_semantic_clustering_stats.parquet")
+    
+    cluster_summary = pl.DataFrame({
+        "metric": ["n_clusters", "n_noise_points", "noise_percentage", "total_points"],
+        "value": [float(n_clusters), float(n_noise), float(n_noise/len(labels)*100), float(len(labels))]
+    })
+    cluster_summary.write_parquet("output_data/parquet/p1_semantic_clustering_summary.parquet")
+    logger.info("  Saved clustering stats and summary to output_data/parquet/")
     
     total_time = time.time() - total_start
     logger.info(f"Semantic clustering completed in {total_time:.2f} seconds")
@@ -638,6 +731,24 @@ def build_and_analyze_graphs(df, embeddings, lang_labels, sample_size=5000):
     plt.tight_layout()
     plt.savefig("output_data/img/p1_comment_graph_analysis.png", dpi=300)
     plt.close()
+    
+    os.makedirs("output_data/parquet", exist_ok=True)
+    
+    graph_metrics_df = pl.DataFrame({
+        "metric": list(metrics.keys()),
+        "value": [float(v) for v in metrics.values()]
+    })
+    graph_metrics_df.write_parquet("output_data/parquet/p1_graph_metrics.parquet")
+    
+    degree_summary = pl.DataFrame({
+        "metric": ["degree_mean", "degree_std", "degree_max", "degree_median", "degree_95pct"],
+        "value": [
+            float(np.mean(degrees)), float(np.std(degrees)), float(max(degrees)), 
+            float(np.median(degrees)), float(np.percentile(degrees, 95))
+        ]
+    })
+    degree_summary.write_parquet("output_data/parquet/p1_graph_degree_summary.parquet")
+    logger.info("  Saved graph metrics and degree summary to output_data/parquet/")
     
     elapsed = time.time() - start_time
     logger.info(f"Graph analysis completed in {elapsed:.2f} seconds")
@@ -751,5 +862,6 @@ if __name__ == "__main__":
         logger.info(f"  {key}: {value}")
     logger.info("=" * 80)
     logger.info("Visualizations saved to output_data/img/ directory")
+    logger.info("Summary statistics saved to output_data/parquet/ directory")
     logger.info(f"Pipeline completed successfully at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 80)

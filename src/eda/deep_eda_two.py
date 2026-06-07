@@ -1,4 +1,5 @@
 import polars as pl
+import os  # <--- ADD THIS LINE
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -126,6 +127,7 @@ def analyze_embedding_pca(embeddings):
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     axes = axes.flatten()
     pca_results = {}
+    pca_summary = []  # <--- ADD THIS LINE
     
     for i, (name, emb) in enumerate(embeddings.items()):
         logger.info(f"  Computing PCA for {name} (shape: {emb.shape})")
@@ -141,6 +143,14 @@ def analyze_embedding_pca(embeddings):
         
         logger.info(f"    {name}: {n_95} components explain 95% variance, {n_99} components explain 99% variance")
         logger.info(f"    First 10 components explain {cumulative_var[9]*100:.1f}% of variance")
+        
+        pca_summary.append({
+            "embedding_type": name,
+            "n_components_95pct": int(n_95),
+            "n_components_99pct": int(n_99),
+            "variance_first_10": float(cumulative_var[9]) if len(cumulative_var) > 9 else float(cumulative_var[-1]),
+            "variance_first_50": float(cumulative_var[49]) if len(cumulative_var) > 49 else float(cumulative_var[-1])
+        })
         
         sns.lineplot(
             x=np.arange(1, len(pca.explained_variance_ratio_) + 1),
@@ -163,6 +173,11 @@ def analyze_embedding_pca(embeddings):
     plt.savefig("output_data/img/phase2_pca_variance.png", dpi=300)
     plt.close()
     logger.info("Saved PCA visualization to output_data/img/phase2_pca_variance.png")
+    
+    # --- SAVE IMPORTANT NUMBERS TO PARQUET ---
+    os.makedirs("output_data/parquet", exist_ok=True)
+    pl.DataFrame(pca_summary).write_parquet("output_data/parquet/phase2_pca_summary.parquet")
+    logger.info("Saved PCA summary to output_data/parquet/phase2_pca_summary.parquet")
     
     elapsed = time.time() - start_time
     logger.info(f"PCA analysis completed in {elapsed:.2f} seconds")
@@ -188,6 +203,7 @@ def analyze_embedding_projections(embeddings, lang_labels, sample_size=10000):
     fig, axes = plt.subplots(2, 2, figsize=(18, 14))
     axes = axes.flatten()
     projection_results = {}
+    projection_summary = [] 
     
     for i, (name, emb) in enumerate(embeddings.items()):
         logger.info(f"  Computing UMAP projection for {name}")
@@ -198,6 +214,18 @@ def analyze_embedding_projections(embeddings, lang_labels, sample_size=10000):
         reducer_umap = umap.UMAP(n_neighbors=30, min_dist=0.1, metric="cosine", n_components=2, random_state=42)
         emb_umap = reducer_umap.fit_transform(emb_sample)
         projection_results[f"{name}_umap"] = emb_umap
+        
+        umap_df = pl.DataFrame({"x": emb_umap[:, 0], "y": emb_umap[:, 1], "lang": lang_sample})
+        lang_vars = umap_df.group_by("lang").agg([
+            pl.col("x").var().alias("var_x"),
+            pl.col("y").var().alias("var_y")
+        ])
+        for row in lang_vars.iter_rows():
+            projection_summary.append({
+                "embedding_type": name, "projection": "UMAP", "lang": row[0], 
+                "var_x": float(row[1]) if row[1] is not None else 0.0, 
+                "var_y": float(row[2]) if row[2] is not None else 0.0
+            })
         
         logger.info(f"    UMAP completed in {time.time() - start_umap:.2f} seconds")
         
@@ -227,6 +255,19 @@ def analyze_embedding_projections(embeddings, lang_labels, sample_size=10000):
         emb_tsne = reducer_tsne.fit_transform(emb_sample)
         projection_results[f"{name}_tsne"] = emb_tsne
         
+        # Calculate variance per language to show spread/clustering in 2D space
+        tsne_df = pl.DataFrame({"x": emb_tsne[:, 0], "y": emb_tsne[:, 1], "lang": lang_sample})
+        lang_vars_tsne = tsne_df.group_by("lang").agg([
+            pl.col("x").var().alias("var_x"),
+            pl.col("y").var().alias("var_y")
+        ])
+        for row in lang_vars_tsne.iter_rows():
+            projection_summary.append({
+                "embedding_type": name, "projection": "t-SNE", "lang": row[0], 
+                "var_x": float(row[1]) if row[1] is not None else 0.0, 
+                "var_y": float(row[2]) if row[2] is not None else 0.0
+            })
+        
         logger.info(f"    t-SNE completed in {time.time() - start_tsne:.2f} seconds")
         
         sns.scatterplot(
@@ -239,6 +280,11 @@ def analyze_embedding_projections(embeddings, lang_labels, sample_size=10000):
     plt.savefig("output_data/img/phase2_tsne_projections.png", dpi=300)
     plt.close()
     logger.info("Saved t-SNE projections to output_data/img/phase2_tsne_projections.png")
+    
+    # --- SAVE IMPORTANT NUMBERS TO PARQUET ---
+    os.makedirs("output_data/parquet", exist_ok=True)
+    pl.DataFrame(projection_summary).write_parquet("output_data/parquet/phase2_projection_variance.parquet")
+    logger.info("Saved projection variance summary to output_data/parquet/phase2_projection_variance.parquet")
     
     elapsed = time.time() - start_time
     logger.info(f"Embedding projections analysis completed in {elapsed:.2f} seconds")
@@ -303,6 +349,20 @@ def cluster_embeddings_hdbscan(embeddings, lang_labels):
     plt.close()
     logger.info("Saved clustering visualization to output_data/img/phase2_hdbscan_clustering.png")
     
+    # --- SAVE IMPORTANT NUMBERS TO PARQUET ---
+    cluster_summary = []
+    cluster_summary.append({"metric": "n_clusters", "value": float(n_clusters)})
+    cluster_summary.append({"metric": "n_noise_points", "value": float(n_noise)})
+    cluster_summary.append({"metric": "noise_percentage", "value": float(n_noise/len(labels)*100)})
+    
+    for label, size in sorted(cluster_sizes.items(), key=lambda x: x[1], reverse=True)[:10]:
+        if label != -1:
+            cluster_summary.append({"metric": f"cluster_{label}_size", "value": float(size)})
+            
+    os.makedirs("output_data/parquet", exist_ok=True)
+    pl.DataFrame(cluster_summary).write_parquet("output_data/parquet/phase2_hdbscan_summary.parquet")
+    logger.info("Saved HDBSCAN summary to output_data/parquet/phase2_hdbscan_summary.parquet")
+    
     elapsed = time.time() - start_time
     logger.info(f"HDBSCAN clustering completed in {elapsed:.2f} seconds")
     
@@ -344,6 +404,11 @@ def characterize_clusters(df, cluster_labels, lang_labels):
     plt.close()
     logger.info("Saved cluster characterization to output_data/img/phase2_cluster_characterization.png")
     
+    # --- SAVE IMPORTANT NUMBERS TO PARQUET ---
+    os.makedirs("output_data/parquet", exist_ok=True)
+    cluster_stats.write_parquet("output_data/parquet/phase2_cluster_characterization.parquet")
+    logger.info("Saved cluster stats to output_data/parquet/phase2_cluster_characterization.parquet")
+    
     elapsed = time.time() - start_time
     logger.info(f"Cluster characterization completed in {elapsed:.2f} seconds")
     
@@ -355,6 +420,7 @@ def compute_persistent_homology(embeddings, sample_size=2000):
     
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     axes = axes.flatten()
+    ph_summary = []  # <--- ADD THIS LINE
     
     for i, (name, emb) in enumerate(embeddings.items()):
         logger.info(f"  Processing {name} for persistent homology")
@@ -378,6 +444,25 @@ def compute_persistent_homology(embeddings, sample_size=2000):
         persim.plot_diagrams(diagrams, show=False, ax=axes[i])
         axes[i].set_title(f"Persistent Homology: {name}")
         
+        # Extract topological feature counts and persistence
+        h0_dgm = diagrams[0]
+        h1_dgm = diagrams[1]
+        h0_finite = h0_dgm[np.isfinite(h0_dgm[:, 1])]
+        h1_finite = h1_dgm[np.isfinite(h1_dgm[:, 1])]
+        
+        h0_persistence = h0_finite[:, 1] - h0_finite[:, 0] if len(h0_finite) > 0 else np.array([])
+        h1_persistence = h1_finite[:, 1] - h1_finite[:, 0] if len(h1_finite) > 0 else np.array([])
+        
+        ph_summary.append({
+            "embedding_type": name,
+            "h0_features": len(h0_dgm),
+            "h1_features": len(h1_dgm),
+            "h0_max_persistence": float(h0_persistence.max()) if len(h0_persistence) > 0 else 0.0,
+            "h1_max_persistence": float(h1_persistence.max()) if len(h1_persistence) > 0 else 0.0,
+            "h0_mean_persistence": float(h0_persistence.mean()) if len(h0_persistence) > 0 else 0.0,
+            "h1_mean_persistence": float(h1_persistence.mean()) if len(h1_persistence) > 0 else 0.0
+        })
+        
         progress_pct = (i + 1) / len(embeddings) * 100
         logger.info(f"    Progress: {progress_pct:.1f}%")
     
@@ -385,6 +470,11 @@ def compute_persistent_homology(embeddings, sample_size=2000):
     plt.savefig("output_data/img/phase2_persistent_homology.png", dpi=300)
     plt.close()
     logger.info("Saved persistent homology diagrams to output_data/img/phase2_persistent_homology.png")
+    
+    # --- SAVE IMPORTANT NUMBERS TO PARQUET ---
+    os.makedirs("output_data/parquet", exist_ok=True)
+    pl.DataFrame(ph_summary).write_parquet("output_data/parquet/phase2_persistent_homology_summary.parquet")
+    logger.info("Saved persistent homology summary to output_data/parquet/phase2_persistent_homology_summary.parquet")
     
     elapsed = time.time() - start_time
     logger.info(f"Persistent homology computation completed in {elapsed:.2f} seconds")
@@ -428,7 +518,9 @@ def build_per_language_gow(df, lang_labels, top_langs=3):
         gow_results[lang] = {
             "nodes": G.number_of_nodes(), 
             "edges": G.number_of_edges(), 
-            "avg_degree": np.mean(degrees)
+            "avg_degree": float(np.mean(degrees)) if len(degrees) > 0 else 0.0,
+            "max_degree": int(np.max(degrees)) if len(degrees) > 0 else 0,
+            "median_degree": float(np.median(degrees)) if len(degrees) > 0 else 0.0
         }
         
         logger.info(f"    Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges, avg degree {np.mean(degrees):.2f}")
@@ -445,6 +537,11 @@ def build_per_language_gow(df, lang_labels, top_langs=3):
     plt.savefig("output_data/img/phase3_per_language_gow.png", dpi=300)
     plt.close()
     logger.info("Saved per-language GoW visualizations to output_data/img/phase3_per_language_gow.png")
+    
+    # --- SAVE IMPORTANT NUMBERS TO PARQUET ---
+    os.makedirs("output_data/parquet", exist_ok=True)
+    pl.DataFrame([{"lang": k, **v} for k, v in gow_results.items()]).write_parquet("output_data/parquet/phase3_per_language_gow_summary.parquet")
+    logger.info("Saved GoW summary to output_data/parquet/phase3_per_language_gow_summary.parquet")
     
     elapsed = time.time() - start_time
     logger.info(f"Per-language GoW analysis completed in {elapsed:.2f} seconds")
@@ -506,6 +603,11 @@ def build_cross_lingual_similarity_graph(embeddings, lang_labels, sample_size=50
     plt.close()
     logger.info("Saved cross-lingual graph visualization to output_data/img/phase3_cross_lingual_graph.png")
     
+    # --- SAVE IMPORTANT NUMBERS TO PARQUET ---
+    os.makedirs("output_data/parquet", exist_ok=True)
+    pl.DataFrame([metrics]).write_parquet("output_data/parquet/phase3_cross_lingual_graph_summary.parquet")
+    logger.info("Saved cross-lingual graph summary to output_data/parquet/phase3_cross_lingual_graph_summary.parquet")
+    
     elapsed = time.time() - start_time
     logger.info(f"Cross-lingual graph construction completed in {elapsed:.2f} seconds")
     
@@ -552,7 +654,9 @@ def build_comment_knn_graph(embeddings, lang_labels, k=15, sample_size=10000):
     metrics = {
         "nodes": G.number_of_nodes(),
         "edges": G.number_of_edges(),
-        "avg_degree": np.mean(degrees),
+        "avg_degree": float(np.mean(degrees)),
+        "max_degree": int(np.max(degrees)),
+        "median_degree": float(np.median(degrees)),
         "num_components": len(components),
         "largest_component_size": largest_component_size
     }
@@ -566,6 +670,11 @@ def build_comment_knn_graph(embeddings, lang_labels, k=15, sample_size=10000):
     plt.savefig("output_data/img/phase3_comment_knn_graph.png", dpi=300)
     plt.close()
     logger.info("Saved k-NN graph visualization to output_data/img/phase3_comment_knn_graph.png")
+    
+    # --- SAVE IMPORTANT NUMBERS TO PARQUET ---
+    os.makedirs("output_data/parquet", exist_ok=True)
+    pl.DataFrame([metrics]).write_parquet("output_data/parquet/phase3_comment_knn_graph_summary.parquet")
+    logger.info("Saved k-NN graph summary to output_data/parquet/phase3_comment_knn_graph_summary.parquet")
     
     elapsed = time.time() - start_time
     logger.info(f"Comment k-NN graph construction completed in {elapsed:.2f} seconds")
@@ -692,6 +801,20 @@ def spectral_clustering_laplacian(embeddings, lang_labels, n_clusters=10, sample
     plt.close()
     logger.info("Saved spectral clustering visualization to output_data/img/phase3_spectral_clustering.png")
     
+    # --- SAVE IMPORTANT NUMBERS TO PARQUET ---
+    os.makedirs("output_data/parquet", exist_ok=True)
+    
+    # 1. Save eigenvalues (important for determining optimal number of clusters via gap heuristic)
+    eigenvalues_df = pl.DataFrame({
+        "eigenvalue_index": np.arange(len(eigenvalues)),
+        "eigenvalue": eigenvalues.astype(float)
+    })
+    eigenvalues_df.write_parquet("output_data/parquet/phase3_spectral_eigenvalues.parquet")
+    
+    # 2. Save language composition per cluster (highly valuable for LLM context)
+    cluster_df.write_parquet("output_data/parquet/phase3_spectral_cluster_composition.parquet")
+    logger.info("Saved spectral clustering eigenvalues and composition to output_data/parquet/")
+    
     elapsed = time.time() - start_time
     logger.info(f"Spectral clustering completed in {elapsed:.2f} seconds")
     
@@ -817,5 +940,6 @@ if __name__ == "__main__":
     logger.info(f"Spectral Clusters: {len(set(phase_3_results['spectral']['clusters']))}")
     logger.info("=" * 80)
     logger.info("Visualizations saved to output_data/img/ directory")
+    logger.info("Summary statistics saved to output_data/parquet/ directory")
     logger.info(f"Pipeline completed successfully at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 80)
