@@ -11,6 +11,7 @@ numeric_cols = [
     "emoji_count", "like_count_log"
 ]
 embedding_cols = ["embedding", "embedding_char", "embedding_word", "embedding_ft"]
+comment_text_col = ["comment_text"]
 
 df = pl.read_parquet(
     COMBINED_DATA_PATH,

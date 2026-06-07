@@ -23,11 +23,16 @@ def convert_jsonl_to_parquet(input_folder: str, output_folder: str = None):
         try:
             df = pl.read_ndjson(jsonl_file)
             
-            columns_to_remove = ["schema_version", "model", "labeled_at"]
-            existing_columns = [col for col in columns_to_remove if col in df.columns]
+            core_columns = ["comment_id", "label"]
+            optional_columns = ["source_file", "source_row", "post_id"]
             
-            if existing_columns:
-                df = df.drop(existing_columns)
+            keep_columns = [col for col in core_columns + optional_columns if col in df.columns]
+            
+            if not keep_columns:
+                print(f"✗ No core columns found in {jsonl_file.name}")
+                continue
+            
+            df = df.select(keep_columns)
             
             parquet_file = output_path / f"{jsonl_file.stem}.parquet"
             df.write_parquet(parquet_file)
@@ -47,16 +52,26 @@ def convert_and_merge_to_single_parquet(input_folder: str, output_file: str = "c
     print(f"Found {len(jsonl_files)} JSONL file(s)")
     
     all_dfs = []
+    core_columns = ["comment_id", "label"]
     
     for jsonl_file in jsonl_files:
         try:
             df = pl.read_ndjson(jsonl_file)
             
-            columns_to_remove = ["schema_version", "model", "labeled_at"]
-            existing_columns = [col for col in columns_to_remove if col in df.columns]
+            optional_columns = ["source_file", "source_row", "post_id"]
+            keep_columns = [col for col in core_columns + optional_columns if col in df.columns]
             
-            if existing_columns:
-                df = df.drop(existing_columns)
+            if not keep_columns:
+                print(f"✗ No core columns found in {jsonl_file.name}")
+                continue
+            
+            df = df.select(keep_columns)
+            
+            for col in core_columns:
+                if col not in df.columns:
+                    df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias(col))
+            
+            df = df.select(core_columns + [col for col in optional_columns if col in df.columns])
             
             all_dfs.append(df)
             print(f"✓ Loaded: {jsonl_file.name}")
@@ -65,7 +80,7 @@ def convert_and_merge_to_single_parquet(input_folder: str, output_file: str = "c
             print(f"✗ Error processing {jsonl_file.name}: {e}")
     
     if all_dfs:
-        combined_df = pl.concat(all_dfs)
+        combined_df = pl.concat(all_dfs, how="diagonal_relaxed")
         output_path = Path(output_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         combined_df.write_parquet(output_path)
