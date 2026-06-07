@@ -1,334 +1,392 @@
 import polars as pl
 import numpy as np
-import matplotlib.pyplot as plt
 import seaborn as sns
-import regex as re
-import nltk
+import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE, SpectralEmbedding
 from sklearn.neighbors import NearestNeighbors
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from scipy.linalg import orthogonal_procrustes
-from langdetect import detect_langs
-from collections import Counter
+from scipy.sparse import csr_matrix, tril
 import umap
 import hdbscan
 import networkx as nx
+import igraph as ig
+import ripser
+import persim
+import re
+import langdetect
+from collections import Counter
+import warnings
+import os
 
-COMBINED_DATA_PATH = "../data/combined_embeddings.parquet"
+warnings.filterwarnings("ignore")
+plt.style.use("seaborn-v0_8-whitegrid")
+sns.set_palette("viridis")
 
-numeric_cols = [
+COMBINED_DATA_PATH = "data/combined_embeddings.parquet"
+NUMERIC_COLS = [
     "like_count", "reply_count", "char_count", "word_count",
     "avg_word_length", "uppercase_ratio", "exclamation_count",
     "question_count", "hashtag_count", "mention_count",
     "emoji_count", "like_count_log"
 ]
+EMBEDDING_COLS = ["embedding", "embedding_char", "embedding_word", "embedding_ft"]
+TEXT_COL = "comment_text"
 
-embedding_cols = ["embedding", "embedding_char", "embedding_word", "embedding_ft"]
-comment_text_col = ["comment_text"]
-meta_cols = ["published_at", "crawled_at", "source_query"]
-
-def load_and_prepare_data():
+def load_data():
     df = pl.read_parquet(
         COMBINED_DATA_PATH,
-        columns=numeric_cols + embedding_cols + comment_text_col + meta_cols
+        columns=NUMERIC_COLS + EMBEDDING_COLS + [TEXT_COL, "published_at", "crawled_at", "source_query"]
     )
-    
-    X_numeric = df.select(numeric_cols).to_numpy().astype(np.float32)
-    
+    X_numeric = df.select(NUMERIC_COLS).to_numpy().astype(np.float32)
     embeddings = {}
-    for col in embedding_cols:
+    for col in EMBEDDING_COLS:
         embeddings[col] = np.stack(df[col].to_numpy())
-        
     X_all = np.hstack([X_numeric] + list(embeddings.values()))
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_all)
-    
-    return df, embeddings, X_scaled
+    return df, X_scaled, embeddings, scaler
 
-def identify_language(text):
-    if not text:
-        return "unknown"
+def detect_language(text):
     try:
-        return detect_langs(text)[0].lang
-    except Exception:
+        return langdetect.detect(text)
+    except Exception as e:
         return "unknown"
 
 def detect_script(text):
-    if not text:
-        return "Unknown"
-    scripts = re.findall(r'\p{Script=Latin}|\p{Script=Cyrillic}|\p{Script=Arabic}|\p{Script=Han}', text)
-    if not scripts:
-        return "Unknown"
-    return max(set(scripts), key=scripts.count)
+    scripts = {
+        "Latin": r"[\u0041-\u005A\u0061-\u007A\u00C0-\u024F]",
+        "Cyrillic": r"[\u0400-\u04FF]",
+        "CJK": r"[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u309F\u30A0-\u30FF]",
+        "Arabic": r"[\u0600-\u06FF\u0750-\u077F]",
+        "Devanagari": r"[\u0900-\u097F]"
+    }
+    for script, pattern in scripts.items():
+        if re.search(pattern, text):
+            return script
+    return "Other"
 
-def process_language_quality(df):
-    df = df.with_columns(
-        pl.col("comment_text").map_elements(identify_language, return_dtype=pl.String).alias("language"),
-        pl.col("comment_text").map_elements(detect_script, return_dtype=pl.String).alias("script")
-    )
+def detect_code_switching(text):
+    tokens = text.split()
+    if len(tokens) < 5:
+        return 0.0
+    window_size = 3
+    langs = []
+    for i in range(0, len(tokens) - window_size + 1, 2):
+        window = " ".join(tokens[i:i+window_size])
+        try:
+            langs.append(langdetect.detect(window))
+        except Exception as e:
+            langs.append("unknown")
+    if len(langs) < 2:
+        return 0.0
+    switches = sum(1 for i in range(len(langs)-1) if langs[i] != langs[i+1] and langs[i] != "unknown" and langs[i+1] != "unknown")
+    return switches / (len(langs) - 1)
+
+def apply_language_architecture(df):
+    df = df.with_columns([
+        pl.col(TEXT_COL).map_elements(detect_language, return_dtype=pl.Utf8).alias("lang_primary"),
+        pl.col(TEXT_COL).map_elements(detect_script, return_dtype=pl.Utf8).alias("script_type"),
+        pl.col(TEXT_COL).map_elements(detect_code_switching, return_dtype=pl.Float64).alias("code_switch_ratio")
+    ])
+    df = df.with_columns([
+        pl.when(pl.col("code_switch_ratio") > 0.3).then(pl.lit(True)).otherwise(pl.lit(False)).alias("is_code_switched"),
+        pl.when(pl.col("lang_primary") != pl.col("lang_primary").filter(pl.col("script_type") == "Latin").mode().first())
+          .then(pl.lit(True)).otherwise(pl.lit(False)).alias("lang_script_mismatch")
+    ])
     return df
 
-def handle_nulls(df):
-    df = df.filter(pl.col("comment_text").is_not_null())
-    df = df.with_columns(
-        pl.col("like_count").fill_null(pl.col("like_count").median().over("language")),
-        pl.col("published_at").fill_null(pl.col("crawled_at"))
-    )
+def handle_nulls_stratified(df):
+    df = df.filter(pl.col(TEXT_COL).is_not_null())
+    df = df.with_columns([
+        pl.col("like_count").fill_null(
+            pl.col("like_count").over("lang_primary").median()
+        ),
+        pl.col("reply_count").fill_null(
+            pl.col("reply_count").over("lang_primary").median()
+        ),
+        pl.col("published_at").fill_null(pl.col("crawled_at")).alias("published_at_proxy"),
+        pl.when(pl.col("published_at").is_null()).then(pl.lit(1)).otherwise(pl.lit(0)).alias("time_uncertainty_flag")
+    ])
     return df
 
-def compute_stratified_stats(df):
-    top_langs = df["language"].value_counts().sort("count", descending=True).head(10)["language"].to_list()
-    df_top = df.filter(pl.col("language").is_in(top_langs))
+def compute_multilingual_descriptive_stats(df):
+    lang_counts = df.group_by("lang_primary").agg(pl.len().alias("count")).filter(pl.col("count") > 1000)
+    valid_langs = lang_counts["lang_primary"].to_list()
+    df_filtered = df.filter(pl.col("lang_primary").is_in(valid_langs))
     
-    stats = df_top.group_by("language").agg([
+    stats = df_filtered.group_by("lang_primary").agg([
         pl.col("char_count").mean().alias("avg_chars"),
         pl.col("word_count").mean().alias("avg_words"),
-        (pl.col("emoji_count") / pl.col("char_count")).mean().alias("emoji_density"),
-        pl.col("uppercase_ratio").mean().alias("avg_caps"),
-        pl.col("like_count").mean().alias("avg_likes")
-    ])
+        (pl.col("emoji_count") / pl.col("char_count").clip(1, None) * 100).mean().alias("emoji_density"),
+        pl.col("uppercase_ratio").mean().alias("avg_uppercase"),
+        pl.col("exclamation_count").mean().alias("avg_exclamation"),
+        pl.col("question_count").mean().alias("avg_question"),
+        pl.col("like_count").mean().alias("avg_likes"),
+        pl.col("reply_count").mean().alias("avg_replies")
+    ]).sort("avg_likes", descending=True)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    sns.barplot(data=stats.to_pandas(), x="lang_primary", y="avg_chars", ax=axes[0, 0], palette="mako")
+    axes[0, 0].set_title("Average Character Count by Language")
+    axes[0, 0].tick_params(axis='x', rotation=45)
+    
+    sns.barplot(data=stats.to_pandas(), x="lang_primary", y="emoji_density", ax=axes[0, 1], palette="flare")
+    axes[0, 1].set_title("Emoji Density (per 100 chars) by Language")
+    axes[0, 1].tick_params(axis='x', rotation=45)
+    
+    sns.barplot(data=stats.to_pandas(), x="lang_primary", y="avg_likes", ax=axes[1, 0], palette="viridis")
+    axes[1, 0].set_title("Average Like Count by Language")
+    axes[1, 0].tick_params(axis='x', rotation=45)
+    
+    corr_matrix = df_filtered.select(NUMERIC_COLS + ["lang_primary"]).to_pandas().pivot_table(index="lang_primary", values=NUMERIC_COLS, aggfunc="mean").corr()
+    sns.heatmap(corr_matrix, annot=True, cmap="coolwarm", ax=axes[1, 1], fmt=".2f")
+    axes[1, 1].set_title("Cross-Lingual Feature Correlation Matrix")
+    
+    plt.tight_layout()
+    plt.savefig("output_data/img/p0_multilingual_descriptive_stats.png", dpi=300)
+    plt.close()
     return stats
 
-def plot_language_distributions(df):
-    top_langs = df["language"].value_counts().sort("count", descending=True).head(5)["language"].to_list()
-    df_top = df.filter(pl.col("language").is_in(top_langs))
-    df_pdf = df_top.with_columns((pl.col("emoji_count") / pl.col("char_count")).alias("emoji_density")).to_pandas()
+def perform_dimensionality_reduction(embeddings, lang_labels, sample_size=10000):
+    np.random.seed(42)
+    n_samples = min(sample_size, len(lang_labels))
+    idx = np.random.choice(len(lang_labels), n_samples, replace=False)
+    lang_sample = np.array(lang_labels)[idx]
     
-    plt.figure(figsize=(20, 12))
+    results = {}
+    fig, axes = plt.subplots(2, 2, figsize=(18, 14))
     
-    plt.subplot(2, 2, 1)
-    sns.histplot(data=df_pdf, x="char_count", hue="language", element="step", stat="density", common_norm=False)
-    plt.title("Text Length Distribution by Language")
+    for i, (name, emb) in enumerate(embeddings.items()):
+        emb_sample = emb[idx]
+        
+        pca = PCA(n_components=0.95)
+        pca.fit(emb_sample)
+        results[f"{name}_pca_var"] = pca.explained_variance_ratio_
+        
+        reducer_umap = umap.UMAP(n_neighbors=30, min_dist=0.1, metric="cosine", n_components=2, random_state=42)
+        emb_umap = reducer_umap.fit_transform(emb_sample)
+        results[f"{name}_umap"] = emb_umap
+        
+        sns.scatterplot(x=emb_umap[:, 0], y=emb_umap[:, 1], hue=lang_sample, palette="tab20", s=15, alpha=0.7, ax=axes[i//2, i%2])
+        axes[i//2, i%2].set_title(f"UMAP Projection: {name}")
+        axes[i//2, i%2].legend([], [], frameon=False)
+        
+    plt.tight_layout()
+    plt.savefig("output_data/img/p1_embedding_umap_projections.png", dpi=300)
+    plt.close()
     
-    plt.subplot(2, 2, 2)
-    sns.histplot(data=df_pdf, x="emoji_density", hue="language", element="step", stat="density", common_norm=False)
-    plt.title("Emoji Density Distribution")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for name, emb in embeddings.items():
+        emb_sample = emb[idx]
+        pca = PCA().fit(emb_sample)
+        ax.plot(np.cumsum(pca.explained_variance_ratio_), label=name)
+    ax.set_xlabel("Number of Components")
+    ax.set_ylabel("Cumulative Explained Variance")
+    ax.set_title("PCA Cumulative Variance by Embedding Type")
+    ax.legend()
+    plt.savefig("output_data/img/p1_pca_cumulative_variance.png", dpi=300)
+    plt.close()
     
-    plt.subplot(2, 2, 3)
-    sns.boxplot(data=df_pdf, x="language", y="like_count")
-    plt.yscale("log")
-    plt.title("Engagement Ratios (Likes)")
+    return results
+
+def verify_cross_lingual_alignment(embeddings, df, lang_labels):
+    anchor_mask = df.filter(pl.col("emoji_count") > 0).select(pl.col("comment_text").str.contains(r"[😀-🙏]")).to_numpy().flatten()
+    anchor_indices = np.where(anchor_mask)[0]
+    if len(anchor_indices) < 100:
+        return {"alignment_score": 0.0, "clsc": 0.0}
     
-    plt.subplot(2, 2, 4)
-    sns.countplot(data=df_pdf, x="language", hue="source_query")
-    plt.title("Source Query Distribution")
+    np.random.seed(42)
+    sample_idx = np.random.choice(anchor_indices, min(500, len(anchor_indices)), replace=False)
+    
+    emb_base = embeddings["embedding"][sample_idx]
+    emb_ft = embeddings["embedding_ft"][sample_idx]
+    
+    R, s = orthogonal_procrustes(emb_base, emb_ft)
+    aligned_ft = emb_ft @ R
+    
+    sim_before = np.diag(cosine_similarity(emb_base, emb_ft)).mean()
+    sim_after = np.diag(cosine_similarity(emb_base, aligned_ft)).mean()
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    sns.histplot(np.diag(cosine_similarity(emb_base, emb_ft)), bins=30, kde=True, ax=axes[0], color="skyblue")
+    axes[0].set_title(f"Cross-Lingual Similarity Before Alignment (Mean: {sim_before:.3f})")
+    axes[0].set_xlabel("Cosine Similarity")
+    
+    sns.histplot(np.diag(cosine_similarity(emb_base, aligned_ft)), bins=30, kde=True, ax=axes[1], color="salmon")
+    axes[1].set_title(f"Cross-Lingual Similarity After Procrustes (Mean: {sim_after:.3f})")
+    axes[1].set_xlabel("Cosine Similarity")
     
     plt.tight_layout()
-    plt.show()
+    plt.savefig("output_data/img/p1_cross_lingual_alignment.png", dpi=300)
+    plt.close()
+    
+    return {"sim_before": sim_before, "sim_after": sim_after, "alignment_matrix": R}
 
-def plot_cross_lingual_heatmap(df):
-    top_langs = df["language"].value_counts().sort("count", descending=True).head(10)["language"].to_list()
-    df_top = df.filter(pl.col("language").is_in(top_langs))
+def estimate_local_intrinsic_dimensionality(embeddings, lang_labels, k=20):
+    results = {}
+    fig, ax = plt.subplots(figsize=(10, 6))
     
-    pivot_df = df_top.group_by("language").agg([
-        pl.col(c).mean() for c in numeric_cols
-    ])
-    
-    data_matrix = pivot_df.select(numeric_cols).to_numpy()
-    corr_matrix = np.corrcoef(data_matrix, rowvar=False)
-    
-    plt.figure(figsize=(14, 12))
-    sns.heatmap(corr_matrix, annot=True, cmap="coolwarm", xticklabels=numeric_cols, yticklabels=numeric_cols)
-    plt.title("Cross-Lingual Feature Correlation (Top 10 Languages)")
-    plt.show()
+    for name, emb in embeddings.items():
+        nbrs = NearestNeighbors(n_neighbors=k+1, metric="euclidean").fit(emb)
+        distances, _ = nbrs.kneighbors(emb)
+        distances = distances[:, 1:]
+        
+        lid_scores = -1.0 / np.mean(np.log(distances[:, -1:] / distances[:, :-1] + 1e-8), axis=1)
+        lid_scores = np.clip(lid_scores, 0, 100)
+        results[name] = lid_scores
+        
+        sns.kdeplot(lid_scores, label=name, ax=ax, fill=True, alpha=0.3)
+        
+    ax.set_xlabel("Local Intrinsic Dimensionality (LID)")
+    ax.set_ylabel("Density")
+    ax.set_title("LID Distribution Across Embedding Spaces")
+    ax.legend()
+    plt.savefig("output_data/img/p1_lid_distributions.png", dpi=300)
+    plt.close()
+    return results
 
-def analyze_embedding_structure(embeddings, df, sample_size=10000):
-    sample_idx = np.random.choice(len(df), sample_size, replace=False)
+def compute_persistent_homology(embeddings, sample_size=2000):
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    axes = axes.flatten()
     
-    plt.figure(figsize=(20, 10))
-    plot_idx = 1
-    
-    for col, emb in embeddings.items():
-        if col != "embedding_ft":
-            continue
-            
-        emb_sample = emb[sample_idx]
-        lang_sample = df["language"].to_numpy()[sample_idx]
+    for i, (name, emb) in enumerate(embeddings.items()):
+        np.random.seed(42)
+        idx = np.random.choice(len(emb), min(sample_size, len(emb)), replace=False)
+        emb_sample = emb[idx]
         
-        pca = PCA(n_components=2)
-        emb_pca = pca.fit_transform(emb_sample)
+        diagrams = ripser.ripser(emb_sample, maxdim=1)["dgms"]
+        persim.plot_diagrams(diagrams, show=False, ax=axes[i])
+        axes[i].set_title(f"Persistent Homology: {name}")
         
-        plt.subplot(1, 2, plot_idx)
-        sns.scatterplot(x=emb_pca[:, 0], y=emb_pca[:, 1], hue=lang_sample, palette="tab10", s=10, alpha=0.5, legend=False)
-        plt.title(f"{col} - PCA")
-        plot_idx += 1
-        
-        umap_model = umap.UMAP(n_neighbors=30, min_dist=0.1, metric="cosine", n_components=2)
-        emb_umap = umap_model.fit_transform(emb_sample)
-        
-        plt.subplot(1, 2, plot_idx)
-        sns.scatterplot(x=emb_umap[:, 0], y=emb_umap[:, 1], hue=lang_sample, palette="tab10", s=10, alpha=0.5)
-        plt.title(f"{col} - UMAP")
-        plot_idx += 1
-
     plt.tight_layout()
-    plt.show()
+    plt.savefig("output_data/img/p1_persistent_homology.png", dpi=300)
+    plt.close()
+    return {"diagrams_computed": True}
 
-def verify_cross_lingual_alignment(embeddings, df, lang1="en", lang2="es"):
-    emb = embeddings["embedding_ft"]
+def perform_semantic_clustering(embeddings, df, lang_labels):
+    emb_ft = embeddings["embedding_ft"]
     
-    mask1 = df["language"].to_numpy() == lang1
-    mask2 = df["language"].to_numpy() == lang2
+    reducer = umap.UMAP(n_neighbors=30, min_dist=0.1, metric="cosine", n_components=10, random_state=42)
+    emb_reduced = reducer.fit_transform(emb_ft)
     
-    idx1 = np.where(mask1)[0]
-    idx2 = np.where(mask2)[0]
-    
-    sample_size = min(len(idx1), len(idx2), 5000)
-    if sample_size == 0:
-        return 0.0
-        
-    idx1_sample = np.random.choice(idx1, sample_size, replace=False)
-    idx2_sample = np.random.choice(idx2, sample_size, replace=False)
-    
-    emb1 = emb[idx1_sample]
-    emb2 = emb[idx2_sample]
-    
-    pca = PCA(n_components=50)
-    emb1_pca = pca.fit_transform(emb1)
-    emb2_pca = pca.transform(emb2)
-    
-    R, scale = orthogonal_procrustes(emb1_pca, emb2_pca)
-    aligned_emb2 = np.dot(emb2_pca, R)
-    
-    similarities = np.sum(emb1_pca * aligned_emb2, axis=1) / (np.linalg.norm(emb1_pca, axis=1) * np.linalg.norm(aligned_emb2, axis=1))
-    return similarities.mean()
-
-def compute_embedding_geometry(embeddings, df):
-    sample_idx = np.random.choice(len(df), 5000, replace=False)
-    emb = embeddings["embedding_ft"][sample_idx]
-    
-    nn = NearestNeighbors(n_neighbors=10, metric="cosine")
-    nn.fit(emb)
-    distances, _ = nn.kneighbors(emb)
-    
-    m = distances.shape[1] - 1
-    sum_log_r = np.sum(np.log(distances[:, 1:] / distances[:, 1:2]))
-    lid = -m / sum_log_r
-    return lid.mean()
-
-def semantic_clustering_pipeline(embeddings, df, sample_size=20000):
-    sample_idx = np.random.choice(len(df), sample_size, replace=False)
-    emb = embeddings["embedding_ft"][sample_idx]
-    
-    reducer = umap.UMAP(n_neighbors=30, min_dist=0.1, metric="cosine", n_components=10)
-    emb_reduced = reducer.fit_transform(emb)
-    
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=100, min_samples=10, metric="euclidean")
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=100, min_samples=10, metric="euclidean", cluster_selection_method="eom")
     labels = clusterer.fit_predict(emb_reduced)
     
-    return sample_idx, labels
-
-def characterize_clusters(df, sample_idx, labels):
-    df_sample = df[sample_idx]
-    df_sample = df_sample.with_columns(pl.Series("cluster", labels))
-    
-    cluster_stats = df_sample.group_by("cluster").agg([
-        pl.col("language").value_counts().alias("lang_dist"),
-        pl.col("like_count").mean().alias("avg_likes"),
-        pl.col("source_query").value_counts().alias("source_dist")
+    df_clustered = df.with_columns([
+        pl.Series("cluster_label", labels),
+        pl.Series("lang_primary", lang_labels)
     ])
-    return cluster_stats
+    
+    cluster_stats = df_clustered.group_by("cluster_label").agg([
+        pl.len().alias("size"),
+        pl.col("like_count").mean().alias("avg_likes"),
+        pl.col("reply_count").mean().alias("avg_replies"),
+        pl.col("lang_primary").mode().first().alias("dominant_lang")
+    ]).filter(pl.col("cluster_label") != -1).sort("size", descending=True)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    sns.scatterplot(x=emb_reduced[:, 0], y=emb_reduced[:, 1], hue=labels, palette="tab20", s=10, alpha=0.6, ax=axes[0])
+    axes[0].set_title("UMAP + HDBSCAN Semantic Clusters")
+    axes[0].legend([], [], frameon=False)
+    
+    top_clusters = cluster_stats.head(10).to_pandas()
+    sns.barplot(data=top_clusters, x="cluster_label", y="size", hue="dominant_lang", ax=axes[1], palette="Set2")
+    axes[1].set_title("Top 10 Cluster Sizes & Dominant Language")
+    axes[1].tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    plt.savefig("output_data/img/p1_semantic_clustering.png", dpi=300)
+    plt.close()
+    
+    return df_clustered, cluster_stats
 
-def build_monolingual_gow(texts, lang="en"):
-    from nltk.corpus import stopwords
-    nltk.download('stopwords', quiet=True)
+def build_and_analyze_graphs(df, embeddings, lang_labels, sample_size=5000):
+    np.random.seed(42)
+    idx = np.random.choice(len(df), min(sample_size, len(df)), replace=False)
+    texts = df.select(TEXT_COL).to_numpy().flatten()[idx]
+    emb_sample = embeddings["embedding"][idx]
+    lang_sample = np.array(lang_labels)[idx]
     
-    try:
-        stop_words = set(stopwords.words("english" if lang == "en" else lang))
-    except Exception:
-        stop_words = set()
-        
-    word_counts = Counter()
-    edges = Counter()
+    sim_matrix = cosine_similarity(emb_sample)
+    adj_matrix = (sim_matrix > 0.75).astype(int)
+    np.fill_diagonal(adj_matrix, 0)
     
-    for text in texts:
-        if not text:
-            continue
-        words = [w.lower() for w in re.findall(r'\w+', text) if w.lower() not in stop_words]
-        word_counts.update(words)
-        for i in range(len(words) - 1):
-            edges[(words[i], words[i+1])] += 1
-            
-    G = nx.Graph()
-    for word, count in word_counts.most_common(100):
-        G.add_node(word, weight=count)
-        
-    for (w1, w2), weight in edges.most_common(200):
-        if w1 in G and w2 in G:
-            G.add_edge(w1, w2, weight=weight)
-            
-    return G
+    G = nx.from_numpy_array(adj_matrix)
+    components = list(nx.connected_components(G))
+    giant_component = max(components, key=len)
+    G_giant = G.subgraph(giant_component)
+    
+    degrees = [d for n, d in G_giant.degree()]
+    avg_clustering = nx.average_clustering(G_giant)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    sns.histplot(degrees, bins=50, kde=True, ax=axes[0], color="teal")
+    axes[0].set_title("Comment-Comment Graph Degree Distribution")
+    axes[0].set_xlabel("Degree")
+    axes[0].set_ylabel("Count")
+    axes[0].set_yscale("log")
+    
+    lang_edges = 0
+    total_edges = G_giant.number_of_edges()
+    for u, v in G_giant.edges():
+        if lang_sample[u] == lang_sample[v]:
+            lang_edges += 1
+    assortativity = lang_edges / total_edges if total_edges > 0 else 0
+    
+    metrics = {
+        "nodes": G_giant.number_of_nodes(),
+        "edges": total_edges,
+        "avg_clustering": avg_clustering,
+        "language_assortativity": assortativity,
+        "components": len(components)
+    }
+    
+    axes[1].bar(metrics.keys(), metrics.values(), color=["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3"])
+    axes[1].set_title("Graph Topology Metrics")
+    axes[1].tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    plt.savefig("output_data/img/p1_comment_graph_analysis.png", dpi=300)
+    plt.close()
+    
+    return metrics
 
-def build_cross_lingual_graph(embeddings, df, threshold=0.6, sample_size=5000):
-    sample_idx = np.random.choice(len(df), sample_size, replace=False)
-    emb = embeddings["embedding_ft"][sample_idx]
-    langs = df["language"].to_numpy()[sample_idx]
-    
-    norms = np.linalg.norm(emb, axis=1, keepdims=True)
-    emb_norm = emb / norms
-    sim_matrix = np.dot(emb_norm, emb_norm.T)
-    np.fill_diagonal(sim_matrix, 0)
-    
-    G = nx.Graph()
-    for i in range(sample_size):
-        G.add_node(i, lang=langs[i])
-        
-    rows, cols = np.where(sim_matrix > threshold)
-    for r, c in zip(rows, cols):
-        if langs[r] != langs[c]:
-            G.add_edge(r, c, weight=sim_matrix[r, c])
-            
-    return G
+def run_p0_pipeline(df):
+    df_lang = apply_language_architecture(df)
+    df_clean = handle_nulls_stratified(df_lang)
+    stats = compute_multilingual_descriptive_stats(df_clean)
+    return df_clean, stats
 
-def build_comment_graph(embeddings, df, sample_size=10000, threshold=0.8):
-    sample_idx = np.random.choice(len(df), sample_size, replace=False)
-    emb = embeddings["embedding"][sample_idx]
-    
-    norms = np.linalg.norm(emb, axis=1, keepdims=True)
-    emb_norm = emb / norms
-    sim_matrix = np.dot(emb_norm, emb_norm.T)
-    
-    np.fill_diagonal(sim_matrix, 0)
-    
-    G = nx.Graph()
-    G.add_nodes_from(range(sample_size))
-    
-    rows, cols = np.where(sim_matrix > threshold)
-    edges = list(zip(rows, cols))
-    G.add_edges_from(edges)
-    
-    return G
-
-def execute_pipeline():
-    df, embeddings, X_scaled = load_and_prepare_data()
-    
-    df = process_language_quality(df)
-    df = handle_nulls(df)
-    
-    stats = compute_stratified_stats(df)
-    
-    plot_language_distributions(df)
-    plot_cross_lingual_heatmap(df)
-    
-    analyze_embedding_structure(embeddings, df)
-    
-    alignment_score = verify_cross_lingual_alignment(embeddings, df)
-    print(f"Cross-Lingual Alignment Score: {alignment_score}")
-    
-    lid_score = compute_embedding_geometry(embeddings, df)
-    print(f"Local Intrinsic Dimensionality: {lid_score}")
-    
-    sample_idx, cluster_labels = semantic_clustering_pipeline(embeddings, df)
-    cluster_stats = characterize_clusters(df, sample_idx, cluster_labels)
-    
-    en_texts = df.filter(pl.col("language") == "en")["comment_text"].to_list()
-    G_gow = build_monolingual_gow(en_texts, "english")
-    
-    G_cross = build_cross_lingual_graph(embeddings, df)
-    
-    G_comments = build_comment_graph(embeddings, df)
-    
-    return df, stats, G_gow, G_cross, G_comments
+def run_p1_pipeline(df_clean, embeddings, lang_labels):
+    dim_results = perform_dimensionality_reduction(embeddings, lang_labels)
+    align_results = verify_cross_lingual_alignment(embeddings, df_clean, lang_labels)
+    lid_results = estimate_local_intrinsic_dimensionality(embeddings, lang_labels)
+    homology_results = compute_persistent_homology(embeddings)
+    df_clustered, cluster_stats = perform_semantic_clustering(embeddings, df_clean, lang_labels)
+    graph_metrics = build_and_analyze_graphs(df_clean, embeddings, lang_labels)
+    return {
+        "dimensionality": dim_results,
+        "alignment": align_results,
+        "lid": lid_results,
+        "homology": homology_results,
+        "clustering": {"df": df_clustered, "stats": cluster_stats},
+        "graph": graph_metrics
+    }
 
 if __name__ == "__main__":
-    execute_pipeline()
+    df_raw, X_scaled, embeddings, scaler = load_data()
+    lang_labels_raw = ["en"] * len(df_raw)
+    
+    df_p0, p0_stats = run_p0_pipeline(df_raw)
+    lang_labels = df_p0["lang_primary"].to_list()
+    
+    p1_results = run_p1_pipeline(df_p0, embeddings, lang_labels)
+    
+    print("P0 & P1 Analysis Complete. Visualizations saved to current directory.")
+    print(f"Descriptive Stats Shape: {p0_stats.shape}")
+    print(f"Alignment Score Improvement: {p1_results['alignment']['sim_before']:.3f} -> {p1_results['alignment']['sim_after']:.3f}")
+    print(f"Graph Metrics: {p1_results['graph']}")
