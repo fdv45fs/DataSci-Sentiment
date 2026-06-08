@@ -15,6 +15,7 @@ import ripser
 import persim
 import re
 import langdetect
+import argparse
 from collections import Counter
 import warnings
 import time
@@ -33,6 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 COMBINED_DATA_PATH = "data/combined_embeddings.parquet"
+P1_RESUME_BUNDLE_PATH = "output_data/parquet/p1_resume_bundle.parquet"
 NUMERIC_COLS = [
     "like_count", "reply_count", "char_count", "word_count",
     "avg_word_length", "uppercase_ratio", "exclamation_count",
@@ -91,6 +93,59 @@ def detect_language(text):
         return langdetect.detect(text)
     except Exception:
         return "unknown"
+
+def add_language_labels_light(df, persist_bundle=True):
+    logger.info("Adding language labels with the lightweight path")
+    start_time = time.time()
+
+    total_rows = len(df)
+    logger.info(f"Processing {total_rows} comments for language detection")
+
+    df = df.with_columns(
+        pl.col(TEXT_COL).map_elements(detect_language, return_dtype=pl.Utf8).alias("lang_primary")
+    )
+
+    if persist_bundle:
+        os.makedirs("output_data/parquet", exist_ok=True)
+        bundle_cols = [
+            TEXT_COL,
+            "emoji_count",
+            "like_count",
+            "reply_count",
+            "lang_primary",
+            "source_query",
+            "published_at",
+            "crawled_at",
+            "post_id",
+        ]
+        existing_cols = [col for col in bundle_cols if col in df.columns]
+        df.select(existing_cols).write_parquet(P1_RESUME_BUNDLE_PATH)
+        logger.info(f"Saved resume bundle to {P1_RESUME_BUNDLE_PATH}")
+
+    lang_dist = df.group_by("lang_primary").agg(pl.len().alias("count")).sort("count", descending=True)
+    logger.info("Language distribution (top 10):")
+    for row in lang_dist.head(10).iter_rows():
+        logger.info(f"  {row[0]}: {row[1]} comments ({row[1]/total_rows*100:.1f}%)")
+
+    unknown_count = df.filter(pl.col("lang_primary") == "unknown").height
+    logger.info(f"Unknown language detected: {unknown_count} ({unknown_count/total_rows*100:.2f}%)")
+
+    elapsed = time.time() - start_time
+    logger.info(f"Language labeling completed in {elapsed:.2f} seconds")
+
+    return df
+
+def load_p1_resume_bundle():
+    if not os.path.exists(P1_RESUME_BUNDLE_PATH):
+        return None
+
+    logger.info(f"Loading resume bundle from {P1_RESUME_BUNDLE_PATH}")
+    bundle = pl.read_parquet(P1_RESUME_BUNDLE_PATH)
+    if "lang_primary" not in bundle.columns:
+        logger.warning("Resume bundle exists but does not contain lang_primary")
+        return None
+
+    return bundle
 
 def detect_script(text):
     scripts = {
@@ -379,6 +434,15 @@ def verify_cross_lingual_alignment(embeddings, df, lang_labels):
     emb_base = embeddings["embedding"][sample_idx]
     emb_ft = embeddings["embedding_ft"][sample_idx]
     logger.info(f"  Base embedding shape: {emb_base.shape}, FT embedding shape: {emb_ft.shape}")
+
+    if emb_base.shape[1] != emb_ft.shape[1]:
+        common_dim = min(128, emb_base.shape[1], emb_ft.shape[1])
+        logger.warning(
+            f"  Embedding dimensions differ; using PCA fallback to {common_dim} shared dimensions before Procrustes"
+        )
+        emb_base = PCA(n_components=common_dim).fit_transform(emb_base)
+        emb_ft = PCA(n_components=common_dim).fit_transform(emb_ft)
+        logger.info(f"  Reduced shapes for alignment: {emb_base.shape} vs {emb_ft.shape}")
     
     logger.info("  Applying orthogonal Procrustes alignment")
     R, s = orthogonal_procrustes(emb_base, emb_ft)
@@ -557,7 +621,7 @@ def compute_persistent_homology(embeddings, sample_size=2000):
 def perform_semantic_clustering(embeddings, df, lang_labels):
     logger.info("Performing semantic clustering using UMAP + HDBSCAN")
     
-    start_time = total_start = time.time()
+    total_start = time.time()
     
     emb_ft = embeddings["embedding_ft"]
     logger.info(f"  Using fasttext embeddings with shape {emb_ft.shape}")
@@ -655,7 +719,6 @@ def build_and_analyze_graphs(df, embeddings, lang_labels, sample_size=5000):
     
     logger.info(f"  Sampled {actual_sample} comments from {len(df)} total")
     
-    texts = df.select(TEXT_COL).to_numpy().flatten()[idx]
     emb_sample = embeddings["embedding"][idx]
     lang_sample = np.array(lang_labels)[idx]
     
@@ -821,7 +884,37 @@ def run_p1_pipeline(df_clean, embeddings, lang_labels):
         "graph": graph_metrics
     }
 
+def run_p1_resume_pipeline(df_raw, embeddings):
+    logger.info("=" * 60)
+    logger.info("STARTING RESUME MODE: P1-ONLY ANALYSIS")
+    logger.info("=" * 60)
+
+    resume_start = time.time()
+
+    bundle = load_p1_resume_bundle()
+    if bundle is not None:
+        logger.info("Using saved resume bundle")
+        df_lang = bundle
+    else:
+        logger.info("No resume bundle found; generating lightweight language labels only")
+        df_lang = add_language_labels_light(df_raw, persist_bundle=True)
+
+    lang_labels = df_lang["lang_primary"].to_list()
+    logger.info(f"Prepared {len(lang_labels)} language labels for resume run")
+
+    p1_results = run_p1_pipeline(df_lang, embeddings, lang_labels)
+
+    total_time = time.time() - resume_start
+    logger.info(f"RESUME MODE COMPLETED in {total_time:.2f} seconds")
+    logger.info("=" * 60)
+
+    return df_lang, p1_results
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Multilingual comment analysis pipeline")
+    parser.add_argument("--resume-p1", action="store_true", help="Skip P0 and run the P1 analysis from a saved or lightweight language-label bundle")
+    args = parser.parse_args()
+
     logger.info("=" * 80)
     logger.info(f"MULTILINGUAL COMMENT ANALYSIS PIPELINE STARTING at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 80)
@@ -829,32 +922,38 @@ if __name__ == "__main__":
     overall_start = time.time()
     
     df_raw, X_scaled, embeddings, scaler = load_data()
-    
-    logger.info("Creating temporary language labels (will be replaced by actual detection)")
-    lang_labels_raw = ["en"] * len(df_raw)
-    logger.info(f"Initial dummy labels created: {len(lang_labels_raw)} entries")
-    
-    logger.info("Executing P0 Pipeline")
-    df_p0, p0_stats = run_p0_pipeline(df_raw)
-    
-    lang_labels = df_p0["lang_primary"].to_list()
-    logger.info(f"Extracted language labels from P0 output: {len(lang_labels)} entries")
-    
-    unique_langs = set(lang_labels)
-    logger.info(f"Unique languages detected: {len(unique_langs)}")
-    for lang in sorted(unique_langs)[:10]:
-        count = lang_labels.count(lang)
-        logger.info(f"  {lang}: {count} ({count/len(lang_labels)*100:.1f}%)")
-    
-    logger.info("Executing P1 Pipeline")
-    p1_results = run_p1_pipeline(df_p0, embeddings, lang_labels)
+
+    if args.resume_p1:
+        df_p1, p1_results = run_p1_resume_pipeline(df_raw, embeddings)
+        p0_stats = None
+        df_p0 = df_p1
+    else:
+        logger.info("Creating temporary language labels (will be replaced by actual detection)")
+        lang_labels_raw = ["en"] * len(df_raw)
+        logger.info(f"Initial dummy labels created: {len(lang_labels_raw)} entries")
+
+        logger.info("Executing P0 Pipeline")
+        df_p0, p0_stats = run_p0_pipeline(df_raw)
+
+        lang_labels = df_p0["lang_primary"].to_list()
+        logger.info(f"Extracted language labels from P0 output: {len(lang_labels)} entries")
+
+        unique_langs = set(lang_labels)
+        logger.info(f"Unique languages detected: {len(unique_langs)}")
+        for lang in sorted(unique_langs)[:10]:
+            count = lang_labels.count(lang)
+            logger.info(f"  {lang}: {count} ({count/len(lang_labels)*100:.1f}%)")
+
+        logger.info("Executing P1 Pipeline")
+        p1_results = run_p1_pipeline(df_p0, embeddings, lang_labels)
     
     overall_time = time.time() - overall_start
     logger.info("=" * 80)
     logger.info("ANALYSIS COMPLETE - FINAL SUMMARY")
     logger.info("=" * 80)
     logger.info(f"Total execution time: {overall_time:.2f} seconds ({overall_time/60:.2f} minutes)")
-    logger.info(f"Descriptive Stats Shape: {p0_stats.shape}")
+    if p0_stats is not None:
+        logger.info(f"Descriptive Stats Shape: {p0_stats.shape}")
     logger.info(f"Alignment Score Improvement: {p1_results['alignment']['sim_before']:.3f} -> {p1_results['alignment']['sim_after']:.3f}")
     logger.info(f"  Improvement: {(p1_results['alignment']['sim_after'] - p1_results['alignment']['sim_before']) / p1_results['alignment']['sim_before'] * 100:.1f}%")
     logger.info("Graph Metrics:")
