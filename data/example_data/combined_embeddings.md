@@ -27,6 +27,7 @@
 | embedding_word    | FLOAT[]     | YES  | NULL | NULL    | NULL  |
 | embedding_ft      | FLOAT[]     | YES  | NULL | NULL    | NULL  |
 
+# combined_labeled.parquet
 | column_name | column_type | null | key  | default | extra |
 |-------------|-------------|------|------|---------|-------|
 | comment_id  | VARCHAR     | YES  | NULL | NULL    | NULL  |
