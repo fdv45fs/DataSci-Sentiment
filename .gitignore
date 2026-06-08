@@ -13,3 +13,4 @@ SentimentAnalysisApp/
 resources/
 *.jsonl
 *.png
+*.csv
