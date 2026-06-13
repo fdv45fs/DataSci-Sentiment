@@ -11,6 +11,9 @@ from datetime import datetime, UTC
 from sklearn.preprocessing import StandardScaler, RobustScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
+import re
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -321,7 +324,7 @@ def compute_vif_iterative(
     logger.info("=" * 70)
 
     try:
-        from statsmodels.stats.outliers_influence import variance_inflation_factor
+        print("StatsModel import")
     except ImportError:
         logger.error("  statsmodels not installed — installing fallback VIF via correlation")
         logger.warning("  Skipping VIF computation — install statsmodels for full audit")
