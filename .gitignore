@@ -15,3 +15,5 @@ resources/
 *.png
 *.csv
 *.tar.xz
+*.joblib
+*.ttf

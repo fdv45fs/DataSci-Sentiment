@@ -5,6 +5,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import polars as pl
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.font_manager import FontProperties, fontManager
+font_path = os.path.join(os.path.dirname(__file__), "NotoEmoji-Regular.ttf")
+fontManager.addfont(font_path)
+prop = FontProperties(fname=font_path)
+plt.rcParams['font.family'] = 'DejaVu Sans'
 import seaborn as sns
 import logging
 import time
@@ -109,8 +114,8 @@ def data_driven_emoji_survey(df: pl.DataFrame, emoji_lists: list[list[str]]) -> 
 
     survey_df = pl.DataFrame(rows).sort("total", descending=True)
 
-    logger.info("  Top 20 emojis with label breakdown:")
-    for row in survey_df.head(20).iter_rows(named=True):
+    logger.info("  Top 10 emojis with label breakdown:")
+    for row in survey_df.head(10).iter_rows(named=True):
         logger.info(
             f"    {row['emoji']}  ({row['assigned_type']:15s})  "
             f"total={row['total']:>6,}  "
@@ -316,7 +321,7 @@ def plot_emoji_survey_heatmap(survey_df: pl.DataFrame):
     logger.info("Generating emoji survey correlation heatmap")
 
     pct_cols = ["pct_positive", "pct_neutral", "pct_negative"]
-    top20 = survey_df.head(20)
+    top20 = survey_df.head(10)
 
     heatmap_data = top20.select(["emoji"] + pct_cols).to_pandas().set_index("emoji")
     heatmap_data.columns = ["Positive %", "Neutral %", "Negative %"]
@@ -327,9 +332,11 @@ def plot_emoji_survey_heatmap(survey_df: pl.DataFrame):
         linewidths=0.5, ax=ax, vmin=0, vmax=100,
         cbar_kws={"label": "% of emoji comments with label"},
     )
-    ax.set_title("Emoji × Label Distribution (Top 20 most frequent emojis)", fontweight="bold")
+    ax.set_title("Emoji × Label Distribution (Top 10 most frequent emojis)", fontweight="bold")
     ax.set_xlabel("Sentiment Label")
     ax.set_ylabel("Emoji")
+    for label in ax.get_yticklabels():
+        label.set_fontname('Noto Emoji')
     plt.tight_layout()
     plt.savefig(OUTPUT_IMG / "t3_emoji_label_survey_heatmap.png", dpi=200, bbox_inches="tight")
     plt.close()
@@ -367,7 +374,7 @@ def plot_cramers_v_bar(corr_df: pl.DataFrame):
 def plot_top_mi_emojis(top_mi_df: pl.DataFrame):
     logger.info("Generating top MI emojis bar chart")
 
-    top20 = top_mi_df.head(20)
+    top20 = top_mi_df.head(10)
     emojis = top20["emoji"].to_list()
     mi = top20["mi_score"].to_list()
     labels = top20["most_common_label"].to_list()
@@ -379,11 +386,14 @@ def plot_top_mi_emojis(top_mi_df: pl.DataFrame):
     ax.set_yticklabels(emojis, fontsize=12)
     ax.invert_yaxis()
     ax.set_xlabel("Mutual Information Score")
-    ax.set_title("Top 20 Most Label-Discriminating Emojis", fontweight="bold")
+    ax.set_title("Top 10 Most Label-Discriminating Emojis", fontweight="bold")
 
     from matplotlib.patches import Patch
     legend_elems = [Patch(facecolor=c, label=l.capitalize()) for l, c in LABEL_COLORS.items()]
     ax.legend(handles=legend_elems, title="Most common label", fontsize=9)
+
+    for label in ax.get_yticklabels():
+        label.set_fontname('Noto Emoji')
 
     plt.tight_layout()
     plt.savefig(OUTPUT_IMG / "t3_top_discriminating_emojis.png", dpi=200, bbox_inches="tight")
